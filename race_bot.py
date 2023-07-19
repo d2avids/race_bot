@@ -406,7 +406,6 @@ def main():
 if __name__ == '__main__':
     if not check_tokens():
         sys.exit(1)
-    main()
 
     try:
         bot = telegram.Bot(token=TELEGRAM_TOKEN)
@@ -418,3 +417,5 @@ if __name__ == '__main__':
 
     conn = sqlite3.connect('db.sqlite', check_same_thread=False)
     cursor = conn.cursor()
+
+    main()
