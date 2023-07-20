@@ -2,8 +2,8 @@
 <data>
   <object-set>
     <table path="main.results">
-      <table path="main.control_points" name="control_point" from="" to=""/>
-      <table path="main.participants" name="user" from="" to=""/>
+      <table path="main.participants" name="participant_id" from="" to=""/>
+      <table path="main.control_points" name="control_point_id" from="" to=""/>
     </table>
   </object-set>
 </data>
