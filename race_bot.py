@@ -31,7 +31,7 @@ from modules.constants import (ADD_COORDINATES, ADD_PARTICIPANT, ADD_TASK,
                                RESULTS_SPECIFIC, START_MESSAGE,
                                START_RACE_MESSAGE, DEL_RESULTS_CONFIRMATION,
                                DEL_PARTICIPANTS_PROCEDURE_CONFIRMATION,
-                               DEL_RES_PROCEDURE_CONFIRMATION)
+                               DEL_RES_PROCEDURE_CONFIRMATION, NO_POINTS)
 
 load_dotenv()
 
@@ -149,7 +149,9 @@ def admin(update, context):
     является админом.
     """
     user_id = update.message.from_user['id']
-    if is_registered_or_admin(user_id):
+    if is_registered_or_admin(user_id) is False:
+        reply(update, NOT_REGISTERED)
+    elif is_registered_or_admin(user_id):
         button_list = [[telegram.KeyboardButton(s)] for s in ADMIN_BUTTONS]
         keyboard = telegram.ReplyKeyboardMarkup(button_list,
                                                 resize_keyboard=True)
@@ -578,26 +580,30 @@ def go(update, context):
         next_control_point = cursor.fetchone()
 
         context.user_data['participant_id'] = participant_id
-        context.user_data['control_point_id'] = next_control_point[0]
-        context.user_data['point'] = (
-            f'ID: {next_control_point[0]} | '
-            f'Coordinates: {next_control_point[1]} | '
-            f'Task: {next_control_point[2]}'
-        )
-        button = telegram.KeyboardButton(
-            text='Отправить локацию', request_location=True
-        )
-        keyboard = telegram.ReplyKeyboardMarkup(
-            [[button]], one_time_keyboard=True, resize_keyboard=True)
-        reply(
-            update,
-            GO_MESSAGE.format(
-                id=next_control_point[0],
-                coordinates=next_control_point[1],
-                task=next_control_point[2]
-            ),
-            keyboard
-        )
+        if next_control_point:
+            context.user_data['control_point_id'] = next_control_point[0]
+            context.user_data['point'] = (
+                f'ID: {next_control_point[0]} | '
+                f'Coordinates: {next_control_point[1]} | '
+                f'Task: {next_control_point[2]}'
+            )
+            button = telegram.KeyboardButton(
+                text='Отправить локацию', request_location=True
+            )
+            keyboard = telegram.ReplyKeyboardMarkup(
+                [[button]], one_time_keyboard=True, resize_keyboard=True)
+            reply(
+                update,
+                GO_MESSAGE.format(
+                    id=next_control_point[0],
+                    coordinates=next_control_point[1],
+                    task=next_control_point[2]
+                ),
+                keyboard
+            )
+        else:
+            reply(update, NO_POINTS)
+            return ConversationHandler.END
 
         return GO_FINISH
     except sqlite3.Error as err:
