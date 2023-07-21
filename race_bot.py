@@ -31,7 +31,12 @@ from modules.constants import (ADD_COORDINATES, ADD_PARTICIPANT, ADD_TASK,
                                RESULTS_SPECIFIC, START_MESSAGE,
                                START_RACE_MESSAGE, DEL_RESULTS_CONFIRMATION,
                                DEL_PARTICIPANTS_PROCEDURE_CONFIRMATION,
-                               DEL_RES_PROCEDURE_CONFIRMATION, NO_POINTS)
+                               DEL_RES_PROCEDURE_CONFIRMATION, NO_POINTS,
+                               START_RACE_LOCATION_MESSAGE,
+                               START_RACE_LOCATION, START_RACE_PHOTO_MESSAGE,
+                               START_RACE_PHOTO, GO_NO_POINTS, INVALID_TOKEN,
+                               AUTHORIZATION_ERROR, POLLING_ERROR,
+                               BOT_START_SUCCESS)
 
 load_dotenv()
 
@@ -142,10 +147,496 @@ def reply(update, message, keyboard=None, parse_mode='HTML'):
         logger.error(REPLY_TELEGRAM_API_ERROR.format(error=err))
 
 
+def stop(update, context):
+    """Команда /stop завершает диалог с ботом."""
+    return ConversationHandler.END
+
+
+def start(update, context):
+    """Документация бота и список возможных команд."""
+    button = telegram.KeyboardButton(
+        text='/register'
+    )
+    keyboard = telegram.ReplyKeyboardMarkup([[button]], resize_keyboard=True)
+
+    reply(update, START_MESSAGE, keyboard)
+
+
+def register(update, context):
+    """Начинает процедуру регистрации участника."""
+    reply(update, REGISTER_MESSAGE)
+    return ADD_PARTICIPANT
+
+
+def register_add_participant(update, context):
+    """Регистрирует участника в таблице participants."""
+    user_id = update.message.from_user['id']
+    username = update.message.from_user['username']
+    name = update.message.text
+    number = db_table_val(user_id=user_id, username=username, name=name)
+    button = telegram.KeyboardButton(text='/start_race')
+    keyboard = telegram.ReplyKeyboardMarkup(
+        [[button]], resize_keyboard=True, one_time_keyboard=True
+    )
+    reply(update, REGISTER_POSITION_MESSAGE.format(number=number), keyboard)
+    return ConversationHandler.END
+
+
+def start_race(update, context):
+    """
+    Начинает процедуру старта гонки, запрашивая
+    у участника стартовую геолокацию.
+    """
+    user_id = update.message.from_user['id']
+
+    button = telegram.KeyboardButton(
+        text='Отправить локацию', request_location=True
+    )
+    keyboard = telegram.ReplyKeyboardMarkup(
+        [[button]], one_time_keyboard=True, resize_keyboard=True
+    )
+
+    if is_registered_or_admin(user_id) is False:
+        reply(update, NOT_REGISTERED)
+        return ConversationHandler.END
+
+    reply(update, START_RACE_LOCATION_MESSAGE, keyboard)
+    return START_RACE_LOCATION
+
+
+def start_race_location(update, context):
+    """
+    Принимает стартовую локацию участника и запрашивает
+    у него селфи для идентификации участника.
+    """
+    user_id = update.message.from_user['id']
+    username = update.message.from_user['username']
+
+    bot.send_message(
+         chat_id=LOG_CHAT_ID,
+         text=f'Локация участника {user_id}, {username}, на точке старта '
+    )
+
+    bot.forward_message(
+         chat_id=LOG_CHAT_ID,
+         from_chat_id=update.message.chat['id'],
+         message_id=update.message['message_id'],
+     )
+
+    logger.info(PARTICIPANT_SENT_LOCATION.format(
+        user_id=user_id,
+        username=username
+    ))
+
+    reply(update, START_RACE_PHOTO_MESSAGE)
+    return START_RACE_PHOTO
+
+
+def start_race_photo(update, context):
+    """
+    Принимает селфи участника и отдает
+    инструкцию по прохождению гонки, ожидая /go.
+    """
+    user_id = update.message.from_user['id']
+    username = update.message.from_user['username']
+
+    button = telegram.KeyboardButton(text='/go')
+    keyboard = telegram.ReplyKeyboardMarkup([[button]], resize_keyboard=True)
+
+    bot.send_message(
+         chat_id=LOG_CHAT_ID,
+         text=f'Селфи участника {user_id}, {username}, на точке старта:'
+    )
+
+    bot.forward_message(
+         chat_id=LOG_CHAT_ID,
+         from_chat_id=update.message.chat['id'],
+         message_id=update.message['message_id'],
+    )
+
+    logger.info(PARTICIPANT_SENT_PHOTO.format(
+        user_id=user_id,
+        username=username
+    ))
+    try:
+        cursor.execute(
+            '''UPDATE participants SET race_started = 1 WHERE user_id = ?''',
+            (user_id,)
+        )
+        conn.commit()
+
+        cursor.execute(
+            '''SELECT id FROM participants WHERE user_id = ?''',
+            (user_id,)
+        )
+        participant_id = cursor.fetchone()[0]
+
+        cursor.execute('''SELECT id FROM control_points''')
+        control_point_ids = [row[0] for row in cursor.fetchall()]
+        start_time = int(time.time())
+        context.user_data['start_time'] = start_time
+
+        for control_point_id in control_point_ids:
+            cursor.execute(
+                '''INSERT OR IGNORE INTO results '''
+                '''(participant_id, control_point_id, start_time) '''
+                '''VALUES (?, ?, ?)''',
+                (participant_id, control_point_id, start_time)
+            )
+
+        conn.commit()
+        logger.info(PARTICIPANT_STARTED_RACE.format(id=participant_id))
+        reply(
+            update,
+            START_RACE_MESSAGE.format(amount=len(control_point_ids)),
+            keyboard
+        )
+        return ConversationHandler.END
+
+    except sqlite3.Error as err:
+        reply(update, NOT_DATABASE.format(error=err))
+        logger.critical(NOT_DATABASE.format(error=err))
+        return ConversationHandler.END
+
+
+def go(update, context):
+    """
+    Начинает процедуру прохождения контрольных точек, отдавая пользователю
+    первую точку и запрашивая её по прохождению контрольной точки.
+    """
+    user_id = update.message.from_user['id']
+
+    try:
+        cursor.execute(
+            '''SELECT id FROM participants WHERE user_id = ?''',
+            (user_id,)
+        )
+        participant_id = cursor.fetchone()[0]
+        cursor.execute(
+            '''SELECT race_started FROM participants WHERE user_id = ?''',
+            (user_id,)
+        )
+        race_started = cursor.fetchone()
+
+    except sqlite3.Error as err:
+        reply(update, NOT_DATABASE.format(error=err))
+        logger.critical(NOT_DATABASE.format(error=err))
+        return ConversationHandler.END
+
+    if not race_started or race_started[0] != 1:
+        reply(update, NOT_RACE_STARTED)
+        return ConversationHandler.END
+
+    try:
+        cursor.execute(
+            '''SELECT control_point_id FROM results '''
+            '''WHERE participant_id = ? AND finish_time IS NULL '''
+            '''ORDER BY control_point_id '''
+            '''LIMIT 1''',
+            (participant_id,)
+        )
+
+        next_control_point = cursor.fetchone()
+
+        if not next_control_point:
+            cursor.execute(
+                '''SELECT finish_time FROM results '''
+                '''WHERE participant_id = ? '''
+                '''ORDER BY finish_time DESC '''
+                '''LIMIT 1''',
+                (participant_id,)
+            )
+
+            finish_time = cursor.fetchone()
+
+            cursor.execute(
+                '''SELECT start_time FROM results '''
+                '''WHERE participant_id = ? '''
+                '''ORDER BY start_time '''
+                '''LIMIT 1''',
+                (participant_id,)
+            )
+            start_time = cursor.fetchone()
+            if not finish_time or not start_time:
+                reply(update, GO_NO_POINTS)
+                return ConversationHandler.END
+
+            final_time = finish_time[0] - start_time[0]
+            print(final_time)
+
+            hours = final_time // 3600
+            remaining_seconds = final_time % 3600
+            minutes = remaining_seconds // 60
+            seconds = remaining_seconds % 60
+
+            logger.info(PARTICIPANT_FINISHED_RACE.format(
+                participant_id=participant_id,
+                hours=hours,
+                minutes=minutes,
+                seconds=seconds
+            ))
+
+            reply(update, GO_ALL_SUCCESS.format(
+                hours=hours, minutes=minutes, seconds=seconds
+            ))
+
+            return ConversationHandler.END
+
+        cursor.execute(
+            '''SELECT id, coordinates, task '''
+            '''FROM control_points '''
+            '''WHERE id = ?''',
+            (next_control_point[0],)
+        )
+        next_control_point = cursor.fetchone()
+
+        context.user_data['participant_id'] = participant_id
+        if next_control_point:
+            context.user_data['control_point_id'] = next_control_point[0]
+            context.user_data['point'] = (
+                f'ID: {next_control_point[0]} | '
+                f'Coordinates: {next_control_point[1]} | '
+                f'Task: {next_control_point[2]}'
+            )
+            button = telegram.KeyboardButton(
+                text='Отправить локацию', request_location=True
+            )
+            keyboard = telegram.ReplyKeyboardMarkup(
+                [[button]], one_time_keyboard=True, resize_keyboard=True
+            )
+            reply(
+                update,
+                GO_MESSAGE.format(
+                    id=next_control_point[0],
+                    coordinates=next_control_point[1],
+                    task=next_control_point[2]
+                ),
+                keyboard
+            )
+        else:
+            reply(update, NO_POINTS)
+            return ConversationHandler.END
+
+        return GO_FINISH
+    except sqlite3.Error as err:
+        reply(update, NOT_DATABASE.format(error=err))
+        logger.critical(NOT_DATABASE.format(error=err))
+        return ConversationHandler.END
+
+
+def go_finish(update, context):
+    """
+    Принимает локацию и логирует её в чате администраторов, а также
+    запрашивает фотографию по завершению прохождения контрольной точки.
+    """
+    user_id = update.message.from_user['id']
+    username = update.message.from_user['username']
+
+    bot.send_message(
+         chat_id=LOG_CHAT_ID,
+         text=f'Локация участника {user_id}, {username}, прошедшего точку\n'
+              f'{context.user_data["point"]}'
+    )
+    bot.forward_message(
+         chat_id=LOG_CHAT_ID,
+         from_chat_id=update.message.chat['id'],
+         message_id=update.message['message_id'],
+     )
+    logger.info(PARTICIPANT_SENT_LOCATION.format(
+        user_id=user_id,
+        username=username
+    ))
+
+    reply(update, GO_FINISH_MESSAGE)
+    return GO_TASK
+
+
+def go_task(update, context):
+    """
+    Принимает фотографию и логирует её в чате администраторов, а также
+    завершает прохождение контрольной точки.
+    """
+    user_id = update.message.from_user['id']
+    username = update.message.from_user['username']
+
+    bot.send_message(
+         chat_id=LOG_CHAT_ID,
+         text=f'Фотография участника {user_id}, {username}, выполнившего '
+              f'задание следующей контрольной точки:\n'
+              f'{context.user_data["point"]}'
+    )
+    bot.forward_message(
+         chat_id=LOG_CHAT_ID,
+         from_chat_id=update.message.chat['id'],
+         message_id=update.message['message_id'],
+    )
+    finish_time = int(time.time())
+
+    logger.info(PARTICIPANT_SENT_PHOTO.format(
+        user_id=user_id,
+        username=username
+    ))
+
+    try:
+        cursor.execute(
+            '''UPDATE results SET finish_time = ? '''
+            '''WHERE participant_id = ? AND control_point_id = ?''',
+            (
+                finish_time,
+                context.user_data['participant_id'],
+                context.user_data['control_point_id'],
+            )
+        )
+        conn.commit()
+        reply(update, GO_SUCCESS_MESSAGE)
+        return ConversationHandler.END
+    except sqlite3.Error as err:
+        reply(update, NOT_DATABASE.format(error=err))
+        logger.critical(NOT_DATABASE.format(error=err))
+        return ConversationHandler.END
+
+
+def points(update, context):
+    """Выводит список всех контрольных точек в чат. Доступно только админам."""
+    user_id = update.message.from_user['id']
+    if not is_registered_or_admin(user_id):
+        reply(update, NOT_ADMIN)
+        return
+
+    records = db_table_all_points()
+
+    reply_message = (
+        'Список контрольных точек:\n\n'
+    )
+    for row in records:
+        reply_message += f'ID: <code>{row[0]}</code> | '
+        reply_message += f'Coordinates: <code>{row[1]}</code> | '
+        reply_message += f'Task: <code>{row[2]}</code>\n\n'
+    reply(update, reply_message)
+
+
+def participants(update, context):
+    """Выводит список всех участников в чат. Доступно только админам."""
+    user_id = update.message.from_user['id']
+
+    if not is_registered_or_admin(user_id):
+        reply(update, NOT_ADMIN)
+        return
+
+    records = db_table_all_participants()
+
+    reply_message = (
+        'Список участников:\n\n'
+    )
+    for row in records:
+        reply_message += f'ID: <code>{row[0]}</code> | '
+        reply_message += f'User_id: {row[1]} | '
+        reply_message += f'Username: @{row[2]} | '
+        reply_message += f'Name: {row[3]} | '
+        reply_message += f'Is_admin {row[4]}\n\n'
+
+    reply(update, reply_message)
+
+
+def results(update, context):
+    """
+    Начинает процедуру просмотра результатов прохождения участниками
+    контрольных точек. Доступно только админам.
+    """
+    button = telegram.KeyboardButton(text='Посмотреть всех участников')
+    keyboard = telegram.ReplyKeyboardMarkup(
+        [[button]], resize_keyboard=True, one_time_keyboard=True
+    )
+    reply(update, RESULT_MESSAGE, keyboard)
+    return RESULTS_SPECIFIC
+
+
+def results_specific(update, context):
+    """
+    Выводит результаты участника по ID или всех участников.
+    """
+    user_id = update.message.from_user['id']
+
+    if not is_registered_or_admin(user_id):
+        reply(update, NOT_ADMIN)
+        return ConversationHandler.END
+
+    answer = update.message.text
+    message = ''
+
+    if answer.isdigit():
+        try:
+            cursor.execute(
+                '''SELECT * from results '''
+                '''WHERE participant_id = ?''',
+                (answer,)
+            )
+
+        except sqlite3.Error as err:
+            reply(update, NOT_DATABASE.format(error=err))
+            logger.critical(NOT_DATABASE.format(error=err))
+            return ConversationHandler.END
+    else:
+        try:
+            cursor.execute(
+                '''SELECT * FROM results'''
+            )
+        except sqlite3.Error as err:
+            reply(update, NOT_DATABASE.format(error=err))
+            logger.critical(NOT_DATABASE.format(error=err))
+            return ConversationHandler.END
+
+    result = cursor.fetchall()
+
+    if not result:
+        reply(update, 'Записей результатов участника с таким ID нет.')
+
+    for row in result:
+        start_time = datetime.fromtimestamp(row[3])
+        finish_time = None
+        if row[4]:
+            finish_time = datetime.fromtimestamp(row[4])
+        message += (
+            f'ID контрольной точки: {row[1]} | '
+            f'ID участника: {row[2]} | '
+            f'Дата старта: {start_time} | '
+            f'Дата завершения: {finish_time}\n\n'
+        )
+
+    reply(update, message)
+
+    return ConversationHandler.END
+
+
+def overall_results(update, context):
+    """
+    Просмотр общих результатов прохождения гонки участниками.
+    """
+    try:
+        cursor.execute(
+            '''SELECT participant_id, (MAX(finish_time) - MIN(start_time)) '''
+            '''AS final_time '''
+            '''FROM results '''
+            '''GROUP BY participant_id '''
+            '''HAVING COUNT(finish_time) = COUNT(*)'''
+        )
+        result = cursor.fetchall()
+        message = 'Результаты участников, прошедших испытание:\n\n'
+        if result:
+            for row in result:
+                fin_time = datetime.fromtimestamp(row[1])
+                fin_time = fin_time.strftime('%H:%M:%S')
+                message += f'Participant ID: {row[0]} | '
+                message += f'Finish time: {fin_time}\n\n'
+        reply(update, message)
+    except sqlite3.Error as err:
+        reply(update, NOT_DATABASE.format(error=err))
+
+
 def admin(update, context):
     """
-    Начинает процедуру верификации в качестве администратора 
-    или возвращает список админских команд, если пользователь уже 
+    Начинает процедуру верификации в качестве администратора
+    или возвращает список админских команд, если пользователь уже
     является админом.
     """
     user_id = update.message.from_user['id']
@@ -253,65 +744,49 @@ def add_task(update, context):
     return ConversationHandler.END
 
 
-def stop(update, context):
-    """Команда /stop завершает диалог с ботом."""
-    return ConversationHandler.END
-
-
-def start(update, context):
-    """Документация бота и список возможных команд."""
-    button = telegram.KeyboardButton(
-        text='/register'
-    )
-    keyboard = telegram.ReplyKeyboardMarkup([[button]], resize_keyboard=True)
-
-    reply(update, START_MESSAGE, keyboard)
-
-
-def points(update, context):
-    """Выводит список всех контрольных точек в чат. Доступно только админам."""
-    user_id = update.message.from_user['id']
-    if not is_registered_or_admin(user_id):
-        reply(update, NOT_ADMIN)
-        return
-
-    records = db_table_all_points()
-
-    reply_message = (
-        'Список контрольных точек:\n\n'
-    )
-    for row in records:
-        reply_message += f'ID: <code>{row[0]}</code> | '
-        reply_message += f'Coordinates: <code>{row[1]}</code> | '
-        reply_message += f'Task: <code>{row[2]}</code>\n\n'
-    reply(update, reply_message)
-
-
-def participants(update, context):
-    """Выводит список всех участников в чат. Доступно только админам."""
+def del_results(update, context):
+    """Начинает процедуру удаления записей из таблицы results."""
     user_id = update.message.from_user['id']
 
     if not is_registered_or_admin(user_id):
         reply(update, NOT_ADMIN)
-        return
+        return ConversationHandler.END
 
-    records = db_table_all_participants()
-
-    reply_message = (
-        'Список участников:\n\n'
+    buttons = ['Да', 'Нет']
+    button_list = [[telegram.KeyboardButton(s)] for s in buttons]
+    keyboard = telegram.ReplyKeyboardMarkup(
+        button_list, resize_keyboard=True, one_time_keyboard=True
     )
-    for row in records:
-        reply_message += f'ID: <code>{row[0]}</code> | '
-        reply_message += f'User_id: {row[1]} | '
-        reply_message += f'Username: @{row[2]} | '
-        reply_message += f'Name: {row[3]} | '
-        reply_message += f'Is_admin {row[4]}\n\n'
+    reply(update, DEL_RESULTS_CONFIRMATION, keyboard)
+    return DEL_RES_PROCEDURE_CONFIRMATION
 
-    reply(update, reply_message)
+
+def del_results_confirmation(update, context):
+    """Удаляет все результаты из таблицы results."""
+    answer = update.message.text.lower()
+    if answer in ('lf', 'да', 'yes', '+'):
+        try:
+            cursor.execute(
+                '''DELETE from main.results '''
+            )
+            conn.commit()
+            reply(update, DEL_SUCCESS.format(rows_count=cursor.rowcount))
+            logger.warning(DEL.format(table='results'))
+            return ConversationHandler.END
+        except sqlite3.Error as err:
+            reply(update, NOT_DATABASE.format(error=err))
+            logger.critical(NOT_DATABASE.format(error=err))
+            return ConversationHandler.END
+    else:
+        reply(update, DEL_CANCEL)
+        return ConversationHandler.END
 
 
 def del_points(update, context):
-    """Начинает процедуру удаления контрольных точек. Доступно только админам."""
+    """
+    Начинает процедуру удаления контрольных точек.
+    Доступно только админам.
+    """
     user_id = update.message.from_user['id']
     if not is_registered_or_admin(user_id):
         reply(update, NOT_ADMIN)
@@ -326,7 +801,9 @@ def del_points(update, context):
 
 
 def del_points_all_or_specific(update, context):
-    """Удаляет все контрольные точки или начинает процедуру удаления некоторых."""
+    """
+    Удаляет все контрольные точки или начинает процедуру удаления некоторых.
+    """
     answer = update.message.text.lower()
     if answer in ('dct', 'все', 'all', 'clear'):
         try:
@@ -383,7 +860,10 @@ def del_specific_points(update, context):
 
 
 def del_participants(update, context):
-    """Начинает процедуру удаления всех участников. Доступно только админам."""
+    """
+    Начинает процедуру удаления всех участников.
+    Доступно только админам.
+    """
     user_id = update.message.from_user['id']
 
     if not is_registered_or_admin(user_id):
@@ -421,377 +901,6 @@ def del_participants_confirmation(update, context):
         return ConversationHandler.END
 
 
-def register(update, context):
-    """Начинает процедуру регистрации участника."""
-    reply(update, REGISTER_MESSAGE)
-    return ADD_PARTICIPANT
-
-
-def register_add_participant(update, context):
-    """Регистрирует участника в таблице participants."""
-    user_id = update.message.from_user['id']
-    username = update.message.from_user['username']
-    name = update.message.text
-    number = db_table_val(user_id=user_id, username=username, name=name)
-    button = telegram.KeyboardButton(text='/start_race')
-    keyboard = telegram.ReplyKeyboardMarkup(
-        [[button]], resize_keyboard=True, one_time_keyboard=True
-    )
-    reply(update, REGISTER_POSITION_MESSAGE.format(number=number), keyboard)
-    return ConversationHandler.END
-
-
-def start_race(update, context):
-    """Начинает гонку для участника и выводит инструкцию."""
-    user_id = update.message.from_user['id']
-    button = telegram.KeyboardButton(text='/go')
-    keyboard = telegram.ReplyKeyboardMarkup([[button]], resize_keyboard=True)
-
-    if is_registered_or_admin(user_id) is False:
-        reply(update, NOT_REGISTERED)
-        return
-
-    try:
-        cursor.execute(
-            '''UPDATE participants SET race_started = 1 WHERE user_id = ?''',
-            (user_id,)
-        )
-        conn.commit()
-
-        cursor.execute(
-            '''SELECT id FROM participants WHERE user_id = ?''',
-            (user_id,)
-        )
-        participant_id = cursor.fetchone()[0]
-
-        cursor.execute('''SELECT id FROM control_points''')
-        control_point_ids = [row[0] for row in cursor.fetchall()]
-        start_time = int(time.time())
-        context.user_data['start_time'] = start_time
-
-        for control_point_id in control_point_ids:
-            cursor.execute(
-                '''INSERT OR IGNORE INTO results '''
-                '''(participant_id, control_point_id, start_time) '''
-                '''VALUES (?, ?, ?)''',
-                (participant_id, control_point_id, start_time)
-            )
-
-        conn.commit()
-        logger.info(PARTICIPANT_STARTED_RACE.format(id=participant_id))
-        reply(
-            update,
-            START_RACE_MESSAGE.format(amount=len(control_point_ids)),
-            keyboard
-        )
-
-    except sqlite3.Error as err:
-        reply(update, NOT_DATABASE.format(error=err))
-        logger.critical(NOT_DATABASE.format(error=err))
-
-
-def go(update, context):
-    """
-    Начинает процедуру прохождения контрольных точек, отдавая пользователю
-    первую точку и запрашивая локацию.
-    """
-    user_id = update.message.from_user['id']
-
-    try:
-        cursor.execute(
-            '''SELECT id FROM participants WHERE user_id = ?''',
-            (user_id,)
-        )
-        participant_id = cursor.fetchone()[0]
-        cursor.execute(
-            '''SELECT race_started FROM participants WHERE user_id = ?''',
-            (user_id,)
-        )
-        race_started = cursor.fetchone()
-
-    except sqlite3.Error as err:
-        reply(update, NOT_DATABASE.format(error=err))
-        logger.critical(NOT_DATABASE.format(error=err))
-        return ConversationHandler.END
-
-    if not race_started or race_started[0] != 1:
-        reply(update, NOT_RACE_STARTED)
-        return ConversationHandler.END
-
-    try:
-        cursor.execute(
-            '''SELECT control_point_id FROM results '''
-            '''WHERE participant_id = ? AND finish_time IS NULL '''
-            '''ORDER BY control_point_id '''
-            '''LIMIT 1''',
-            (participant_id,)
-        )
-
-        next_control_point = cursor.fetchone()
-
-        if not next_control_point:
-            cursor.execute(
-                '''SELECT finish_time FROM results '''
-                '''WHERE participant_id = ? '''
-                '''ORDER BY finish_time DESC '''
-                '''LIMIT 1''',
-                (participant_id,)
-            )
-
-            finish_time = cursor.fetchone()[0]
-
-            cursor.execute(
-                '''SELECT start_time FROM results '''
-                '''WHERE participant_id = ? '''
-                '''ORDER BY start_time '''
-                '''LIMIT 1''',
-                (participant_id,)
-            )
-
-            start_time = cursor.fetchone()[0]
-
-            final_time = finish_time - start_time
-            print(final_time)
-
-            hours = final_time // 3600
-            remaining_seconds = final_time % 3600
-            minutes = remaining_seconds // 60
-            seconds = remaining_seconds % 60
-
-            logger.info(PARTICIPANT_FINISHED_RACE.format(
-                participant_id=participant_id,
-                hours=hours,
-                minutes=minutes,
-                seconds=seconds
-            ))
-
-            reply(update, GO_ALL_SUCCESS.format(
-                hours=hours, minutes=minutes, seconds=seconds
-            ))
-
-            return ConversationHandler.END
-
-        cursor.execute(
-            '''SELECT id, coordinates, task '''
-            '''FROM control_points '''
-            '''WHERE id = ?''',
-            (next_control_point[0],)
-        )
-        next_control_point = cursor.fetchone()
-
-        context.user_data['participant_id'] = participant_id
-        if next_control_point:
-            context.user_data['control_point_id'] = next_control_point[0]
-            context.user_data['point'] = (
-                f'ID: {next_control_point[0]} | '
-                f'Coordinates: {next_control_point[1]} | '
-                f'Task: {next_control_point[2]}'
-            )
-            button = telegram.KeyboardButton(
-                text='Отправить локацию', request_location=True
-            )
-            keyboard = telegram.ReplyKeyboardMarkup(
-                [[button]], one_time_keyboard=True, resize_keyboard=True)
-            reply(
-                update,
-                GO_MESSAGE.format(
-                    id=next_control_point[0],
-                    coordinates=next_control_point[1],
-                    task=next_control_point[2]
-                ),
-                keyboard
-            )
-        else:
-            reply(update, NO_POINTS)
-            return ConversationHandler.END
-
-        return GO_FINISH
-    except sqlite3.Error as err:
-        reply(update, NOT_DATABASE.format(error=err))
-        logger.critical(NOT_DATABASE.format(error=err))
-        return ConversationHandler.END
-
-
-def go_finish(update, context):
-    """
-    Принимает локацию и логирует её в чате администраторов, а также
-    запрашивает фотографию по завершению прохождения контрольной точки.
-    """
-    user_id = update.message.from_user['id']
-    username = update.message.from_user['username']
-
-    bot.send_message(
-         chat_id=LOG_CHAT_ID,
-         text=f'Локация участника {user_id}, {username}, проходящего точку\n'
-              f'{context.user_data["point"]}'
-    )
-    bot.forward_message(
-         chat_id=LOG_CHAT_ID,
-         from_chat_id=update.message.chat['id'],
-         message_id=update.message['message_id'],
-     )
-    logger.info(PARTICIPANT_SENT_LOCATION.format(
-        user_id=user_id,
-        username=username
-    ))
-
-    reply(update, GO_FINISH_MESSAGE)
-    return GO_TASK
-
-
-def go_task(update, context):
-    """
-    Принимает фотографию и логирует её в чате администраторов, а также
-    завершает прохождение контрольной точки.
-    """
-    user_id = update.message.from_user['id']
-    username = update.message.from_user['username']
-
-    bot.send_message(
-         chat_id=LOG_CHAT_ID,
-         text=f'Фотография участника {user_id}, {username}, выполнившего '
-              f'задание следующей контрольной точки:\n'
-              f'{context.user_data["point"]}'
-    )
-    bot.forward_message(
-         chat_id=LOG_CHAT_ID,
-         from_chat_id=update.message.chat['id'],
-         message_id=update.message['message_id'],
-    )
-    finish_time = int(time.time())
-
-    logger.info(PARTICIPANT_SENT_PHOTO.format(
-        user_id=user_id,
-        username=username
-    ))
-
-    try:
-        cursor.execute(
-            '''UPDATE results SET finish_time = ? '''
-            '''WHERE participant_id = ? AND control_point_id = ?''',
-            (
-                finish_time,
-                context.user_data['participant_id'],
-                context.user_data['control_point_id'],
-            )
-        )
-        conn.commit()
-        reply(update, GO_SUCCESS_MESSAGE)
-        return ConversationHandler.END
-    except sqlite3.Error as err:
-        reply(update, NOT_DATABASE.format(error=err))
-        logger.critical(NOT_DATABASE.format(error=err))
-
-
-def results(update, context):
-    """
-    Начинает процедуру просмотра результатов участника по ID или всех участников
-    Доступно только админам.
-    """
-    button = telegram.KeyboardButton(text='Посмотреть всех участников')
-    keyboard = telegram.ReplyKeyboardMarkup(
-        [[button]], resize_keyboard=True, one_time_keyboard=True
-    )
-    reply(update, RESULT_MESSAGE, keyboard)
-    return RESULTS_SPECIFIC
-
-
-def results_specific(update, context):
-    """
-    Выводит результаты участника по ID или всех участников.
-    """
-    user_id = update.message.from_user['id']
-
-    if not is_registered_or_admin(user_id):
-        reply(update, NOT_ADMIN)
-        return ConversationHandler.END
-
-    answer = update.message.text
-    message = ''
-
-    if answer.isdigit():
-        try:
-            cursor.execute(
-                '''SELECT * from results '''
-                '''WHERE participant_id = ?''',
-                (answer,)
-            )
-
-        except sqlite3.Error as err:
-            reply(update, NOT_DATABASE.format(error=err))
-            logger.critical(NOT_DATABASE.format(error=err))
-            return ConversationHandler.END
-    else:
-        try:
-            cursor.execute(
-                '''SELECT * FROM results'''
-            )
-        except sqlite3.Error as err:
-            reply(update, NOT_DATABASE.format(error=err))
-            logger.critical(NOT_DATABASE.format(error=err))
-            return ConversationHandler.END
-
-    result = cursor.fetchall()
-
-    if not result:
-        reply(update, 'Записей результатов участника с таким ID нет.')
-
-    for row in result:
-        start_time = datetime.fromtimestamp(row[3])
-        finish_time = None
-        if row[4]:
-            finish_time = datetime.fromtimestamp(row[4])
-        message += (
-            f'ID контрольной точки: {row[1]} | '
-            f'ID участника: {row[2]} | '
-            f'Дата старта: {start_time} | '
-            f'Дата завершения: {finish_time}\n\n'
-        )
-
-    reply(update, message)
-
-    return ConversationHandler.END
-
-
-def del_results(update, context):
-    """Начинает процедуру удаления записей из таблицы results."""
-
-    user_id = update.message.from_user['id']
-
-    if not is_registered_or_admin(user_id):
-        reply(update, NOT_ADMIN)
-        return ConversationHandler.END
-
-    buttons = ['Да', 'Нет']
-    button_list = [[telegram.KeyboardButton(s)] for s in buttons]
-    keyboard = telegram.ReplyKeyboardMarkup(
-        button_list, resize_keyboard=True, one_time_keyboard=True
-    )
-    reply(update, DEL_RESULTS_CONFIRMATION, keyboard)
-    return DEL_RES_PROCEDURE_CONFIRMATION
-
-
-def del_results_confirmation(update, context):
-    """Удаляет все результаты из таблицы results."""
-    answer = update.message.text.lower()
-    if answer in ('lf', 'да', 'yes', '+'):
-        try:
-            cursor.execute(
-                '''DELETE from main.results '''
-            )
-            conn.commit()
-            reply(update, DEL_SUCCESS.format(rows_count=cursor.rowcount))
-            logger.warning(DEL.format(table='results'))
-            return ConversationHandler.END
-        except sqlite3.Error as err:
-            reply(update, NOT_DATABASE.format(error=err))
-            logger.critical(NOT_DATABASE.format(error=err))
-            return ConversationHandler.END
-    else:
-        reply(update, DEL_CANCEL)
-        return ConversationHandler.END
-
-
 def main():
     """Основная логика работы бота."""
     dp = updater.dispatcher
@@ -799,8 +908,22 @@ def main():
     start_handler = CommandHandler('start', start)
     participants_handler = CommandHandler('participants', participants)
     points_handler = CommandHandler('points', points)
+    overall_results_handler = CommandHandler(
+        'overall_results', overall_results
+    )
 
-    start_race_handler = CommandHandler('start_race', start_race)
+    start_race_handler = ConversationHandler(
+        entry_points=[CommandHandler('start_race', start_race)],
+        states={
+            START_RACE_LOCATION: [MessageHandler(
+                Filters.location, start_race_location, pass_user_data=True
+            )],
+            START_RACE_PHOTO: [MessageHandler(
+                Filters.photo, start_race_photo, pass_user_data=True
+            )]
+        },
+        fallbacks=[CommandHandler('stop', stop)]
+    )
 
     results_handler = ConversationHandler(
         entry_points=[CommandHandler('results', results)],
@@ -907,13 +1030,14 @@ def main():
     dp.add_handler(del_points_handler)
     dp.add_handler(del_participants_handler)
     dp.add_handler(del_results_handler)
+    dp.add_handler(overall_results_handler)
 
     try:
         updater.start_polling()
-        print('Бот запущен.')
+        logger.info(BOT_START_SUCCESS)
         updater.idle()
     except telegram.error.TelegramError as err:
-        logger.critical(f'Ошибка при запуске бота {err}')
+        logger.critical(POLLING_ERROR.format(error=err))
 
 
 if __name__ == '__main__':
@@ -940,9 +1064,9 @@ if __name__ == '__main__':
         bot = telegram.Bot(token=TELEGRAM_TOKEN)
         updater = Updater(TELEGRAM_TOKEN, use_context=True)
     except telegram.error.InvalidToken as err:
-        logger.critical(f'Неверный токен {err}')
+        logger.critical(INVALID_TOKEN.format(error=err))
     except telegram.error.TelegramError as err:
-        logger.critical(f'Ошибка авторизации бота {err}')
+        logger.critical(AUTHORIZATION_ERROR.format(error=err))
 
     # Подключение к БД
     try:
