@@ -144,7 +144,12 @@ def reply(update, message, keyboard=None, parse_mode='HTML'):
             parse_mode=parse_mode,
         )
     except telegram.error.TelegramError as err:
-        logger.error(REPLY_TELEGRAM_API_ERROR.format(error=err))
+        logger.warning(REPLY_TELEGRAM_API_ERROR.format(error=err))
+        update.message.reply_text(
+            text=message,
+            reply_markup=keyboard,
+            parse_mode=parse_mode,
+        )
 
 
 def stop(update, context):
@@ -618,14 +623,19 @@ def overall_results(update, context):
             '''AS final_time '''
             '''FROM results '''
             '''GROUP BY participant_id '''
-            '''HAVING COUNT(finish_time) = COUNT(*)'''
+            '''HAVING COUNT(finish_time) = COUNT(*) '''
+            '''ORDER BY final_time'''
         )
         result = cursor.fetchall()
         message = 'Результаты участников, прошедших испытание:\n\n'
         if result:
             for row in result:
-                fin_time = datetime.fromtimestamp(row[1])
-                fin_time = fin_time.strftime('%H:%M:%S')
+                fin_time = row[1]
+                hours = fin_time // 3600
+                remaining_seconds = fin_time % 3600
+                minutes = remaining_seconds // 60
+                seconds = remaining_seconds % 60
+                fin_time = f'{hours} ч. {minutes} мин. {seconds} сек.'
                 message += f'Participant ID: {row[0]} | '
                 message += f'Finish time: {fin_time}\n\n'
         reply(update, message)
