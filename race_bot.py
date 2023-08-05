@@ -401,7 +401,9 @@ async def participants(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = (
         'Список участников:\n\n'
     )
+    counter = 0
     for row in records:
+        counter += 1
         message += f'ID: <code>{row[0]}</code> | '
         message += f'User_id: {row[1]} | '
         message += f'Username: @{row[2]} | '
@@ -409,7 +411,12 @@ async def participants(update: Update, context: ContextTypes.DEFAULT_TYPE):
         message += f'Пол: {row[4]} | '
         message += f'Тип велосипеда: {row[5]} | '
         message += f'Is_admin {row[7]}\n\n'
-
+        # по 15 записей на сообщение
+        if counter == 15:
+            counter = 0
+            await reply(update, message)
+            message = ''
+    # оставшиеся записи
     await reply(update, message)
 
 
@@ -425,10 +432,17 @@ async def points(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = (
         'Список контрольных точек:\n\n'
     )
+    counter = 0
     for row in records:
         message += f'ID: <code>{row[0]}</code> | '
         message += f'Coordinates: <code>{row[1]}</code> | '
         message += f'Task: <code>{row[2]}</code>\n\n'
+        # по 15 записей на сообщение
+        if counter == 15:
+            counter = 0
+            await reply(update, message)
+            message = ''
+        # оставшиеся записи
     await reply(update, message)
 
 
@@ -465,7 +479,9 @@ async def results_specific(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not result:
         await reply(update, NO_RESULTS)
         return ConversationHandler.END
+    counter = 0
     for row in result:
+        counter += 1
         start_time = datetime.fromtimestamp(row[3])
         finish_time = None
         if row[4]:
@@ -476,6 +492,12 @@ async def results_specific(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f'Дата старта: {start_time} | '
             f'Дата завершения: {finish_time}\n\n'
         )
+        # по 15 записей на сообщение
+        if counter == 15:
+            counter = 0
+            await reply(update, message)
+            message = ''
+        # оставшиеся записи
     await reply(update, message)
     return ConversationHandler.END
 
@@ -484,18 +506,30 @@ async def overall_results(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Просмотр общих результатов прохождения гонки участниками.
     """
+    user_id = update.message.from_user['id']
+    if await is_registered_or_admin(user_id) != 2:
+        await reply(update, NOT_ADMIN)
+        return ConversationHandler.END
     result = await database_overall_results()
     message = 'Результаты участников, прошедших испытание:\n\n'
     if result:
+        counter = 0
         for row in result:
+            counter += 1
             fin_time = row[4]
             hours, minutes, seconds = await count_time(fin_time)
             fin_time = f'{hours} ч. {minutes} мин. {seconds} сек.'
-            message += f'Participant ID: {row[0]} | '
-            message += f'Имя: {row[1]} | '
+            message += f'Participant ID: <code>{row[0]}</code> | '
+            message += f'Имя: <code>{row[1]}</code> | '
             message += f'Пол: {row[2]} | '
             message += f'Тип: {row[3]} | '
-            message += f'Finish time: {fin_time}\n\n'
+            message += f'Finish time: <code>{fin_time}</code>\n\n'
+            # выводим по 15 результатов на сообщение
+            if counter == 15:
+                counter = 0
+                await reply(update, message)
+                message = ''
+    # выводим оставшиеся результаты
     await reply(update, message)
 
 
