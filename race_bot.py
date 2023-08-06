@@ -434,11 +434,12 @@ async def points(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     counter = 0
     for row in records:
+        counter += 1
         message += f'ID: <code>{row[0]}</code> | '
         message += f'Coordinates: <code>{row[1]}</code> | '
         message += f'Task: <code>{row[2]}</code>\n\n'
-        # по 15 записей на сообщение
-        if counter == 15:
+        # по 10 записей на сообщение
+        if counter == 10:
             counter = 0
             await reply(update, message)
             message = ''
@@ -629,14 +630,23 @@ async def del_points_all_or_some(update: Update,
         logger.info(DEL.format(table='control_points'))
         return ConversationHandler.END
     records = await database_points()
-    message = (
-        'Перечислите через запятую ID тех точек, '
-        'которые необходимо удалить в формате: 1, 2, 3\n\n'
-    )
+    message = ''
+    counter = 0
     for row in records:
+        counter += 1
         message += f'ID: <code>{row[0]}</code> | '
         message += f'Coordinates: <code>{row[1]}</code> | '
         message += f'Task: <code>{row[2]}</code>\n\n'
+        # по 10 записей на сообщение
+        if counter == 10:
+            counter = 0
+            await reply(update, message)
+            message = ''
+        # оставшиеся записи
+    message += (
+        'Перечислите через запятую ID тех точек, '
+        'которые необходимо удалить в формате: 1, 2, 3\n\n'
+    )
     await reply(update, message)
     return DELETE_SPECIFIC_POINTS
 
